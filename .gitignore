@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+
+# Local virtual environments
+.venv/
+venv/
+env/
+
+# Generated dictionary files
+*.docx
+*.pdf
+
+# Editor and OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
