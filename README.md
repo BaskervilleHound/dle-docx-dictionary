@@ -34,19 +34,19 @@ playwright install chromium
 Look up one word and save it to `diccionario.docx`:
 
 ```powershell
-python test.py amor
+python dlex.py amor
 ```
 
 Read all words from `words.txt`:
 
 ```powershell
-python test.py --words-file
+python dlex.py --words-file
 ```
 
 Use a custom word list and output file:
 
 ```powershell
-python test.py --words-file words.txt --output diccionario.docx
+python dlex.py --words-file words.txt --output diccionario.docx
 ```
 
 `words.txt` can contain comma-separated or newline-separated words:
@@ -62,7 +62,7 @@ The repository does not include the generated dictionary files. Running the
 script creates or updates `diccionario.docx` by default:
 
 ```powershell
-python test.py --words-file
+python dlex.py --words-file
 ```
 
 You can also choose a different output path with `--output`.
