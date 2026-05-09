@@ -75,6 +75,3 @@ Generated DOCX files use this dictionary style:
 - justified dictionary entries, 10 pt
 - etymology in parentheses, 9 pt
 - numbered senses inline with `||`
-
-Generated `.docx` and `.pdf` files are ignored by default in `.gitignore`.
-Remove those ignore rules if you decide to publish generated dictionaries too.
