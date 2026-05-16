@@ -15,12 +15,14 @@ and writes formatted entries into a Word document.
 - Keep entries alphabetized under centered letter headings.
 - Skip words that are already present in the DOCX.
 - Print words not found in DLE at the end of each run.
+- Use the optional graphical interface on Windows.
 
 ## Requirements
 
 - Python 3.10+
 - Playwright
 - python-docx
+- CustomTkinter
 
 Install Python dependencies:
 
@@ -35,6 +37,21 @@ playwright install chromium
 ```
 
 ## Usage
+
+## Portable Windows Release
+
+For the GitHub Release, download `DLEX-portable.exe` and double-click it to
+open the graphical interface. It is portable and does not require installing
+Python.
+
+The older folder build in `dist/DLEX/` only works when `DLEX.exe` stays beside
+its `_internal` folder. Do not distribute that single `DLEX.exe` by itself.
+
+Build the single-file release artifact locally with:
+
+```powershell
+python -m PyInstaller .\DLEX-portable.spec
+```
 
 Look up one word and save it to `diccionario.docx`:
 
@@ -52,6 +69,12 @@ Use a custom word list and output file:
 
 ```powershell
 python dlex.py --words-file words.txt --output diccionario.docx
+```
+
+Open the graphical interface:
+
+```powershell
+python dlex.py --gui
 ```
 
 `words.txt` can contain comma-separated or newline-separated words:
@@ -80,3 +103,6 @@ Generated DOCX files use this dictionary style:
 - justified dictionary entries, 10 pt
 - etymology in parentheses, 9 pt
 - numbered senses inline with `||`
+
+Generated `.docx` and `.pdf` files are ignored by default in `.gitignore`.
+Remove those ignore rules if you decide to publish generated dictionaries too.
