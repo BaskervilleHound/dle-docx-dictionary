@@ -6,6 +6,10 @@ __pycache__/
 venv/
 env/
 
+# Build outputs
+build/
+dist/
+
 # Generated dictionary files
 *.docx
 *.pdf
