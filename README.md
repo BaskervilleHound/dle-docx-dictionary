@@ -1,12 +1,19 @@
 # DLE DOCX Dictionary Builder
 
-Small command-line tool that looks up Spanish words in the online DLE dictionary
+Small tool that looks up Spanish words in the online DLE dictionary
 and writes formatted entries into a Word document.
+
+<div align="center">
+  <img width="671" height="568" alt="image" src="https://github.com/user-attachments/assets/f03ed508-4933-42cb-a29a-cf79b1f61493" />
+  <p>Portable .exe interface</p>
+</div>
 
 <div align="center">
   <img width="611" height="419" alt="image" src="https://github.com/user-attachments/assets/6638adf6-6bca-4e06-bebb-d012a41f45f5"/>
   <p>Example output</p>
 </div>
+
+
 
 ## Features
 
