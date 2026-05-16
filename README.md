@@ -36,8 +36,6 @@ Install the Playwright browser once:
 playwright install chromium
 ```
 
-## Usage
-
 ## Portable Windows Release
 
 For the GitHub Release, download `DLEX-portable.exe` and double-click it to
@@ -52,6 +50,8 @@ Build the single-file release artifact locally with:
 ```powershell
 python -m PyInstaller .\DLEX-portable.spec
 ```
+
+## Usage
 
 Look up one word and save it to `diccionario.docx`:
 
