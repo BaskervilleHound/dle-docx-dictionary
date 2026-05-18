@@ -49,9 +49,6 @@ For the GitHub Release, download `DLEX-portable.exe` and double-click it to
 open the graphical interface. It is portable and does not require installing
 Python.
 
-The older folder build in `dist/DLEX/` only works when `DLEX.exe` stays beside
-its `_internal` folder. Do not distribute that single `DLEX.exe` by itself.
-
 Build the single-file release artifact locally with:
 
 ```powershell
