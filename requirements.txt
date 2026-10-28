@@ -1,3 +1,2 @@
-playwright
 python-docx
 customtkinter

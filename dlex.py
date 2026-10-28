@@ -9,30 +9,27 @@ DOCX are skipped.
 from __future__ import annotations
 
 import argparse
-import os
+import html
+import json
 import re
 import sys
 import threading
+import time
 import unicodedata
+from functools import lru_cache
 from pathlib import Path
 from urllib.parse import quote
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.shared import Pt
-from playwright.sync_api import Error, TimeoutError as PlaywrightTimeoutError, sync_playwright
 
 
-SEARCH_URL = 'https://dle.rae.es/beta'
-SEARCH_INPUT_SELECTORS = [
-    'input.js-autocomplete-input',
-    'input.c-input--search',
-    'input[placeholder="Escriba aquí la palabra"]',
-]
-SUBMIT_BUTTON_SELECTOR = 'button[type=submit]'
-FIRST_DEFINITIONS_SELECTOR = 'ol.c-definitions'
-DEFINITIONS_ITEM_SELECTOR = '> li'
-ETYMOLOGY_SELECTOR = 'div.c-text-intro'
+DEFAULT_INTER_WORD_DELAY = 0
+MAX_INTER_WORD_DELAY = 120
+RAE_API_BASE_URL = 'https://rae-api.com/api/words'
 
 DEFAULT_OUTPUT_PATH = 'diccionario.docx'
 SPANISH_ALPHABET = 'abcdefghijklmnñopqrstuvwxyz'
@@ -41,144 +38,236 @@ SPANISH_ORDER = {letter: index for index, letter in enumerate(SPANISH_ALPHABET)}
 GRAMMAR_PREFIX_RE = re.compile(r'^((?:[a-z]\.|[a-z]{2,}\.)\s+)+')
 WHITESPACE_RE = re.compile(r'\s+')
 WORDS_SPLIT_RE = re.compile(r'[\n,]+')
+RELATED_WORDS_RE = re.compile(r'\s*(?:Sin\.|Ant\.|Sinónimos?|Antónimos?)\s*:.*$', re.IGNORECASE)
+SENSE_NUMBER_PREFIX_RE = re.compile(r'^\s*\d+\.\s*')
 
 
-def configure_playwright_browsers() -> None:
-    """Point bundled executables at the portable Playwright browser folder."""
-    if os.environ.get('PLAYWRIGHT_BROWSERS_PATH'):
-        return
-
-    if not getattr(sys, 'frozen', False):
-        return
-
-    candidate_roots = [
-        Path(getattr(sys, '_MEIPASS', Path(sys.executable).parent)),
-        Path(sys.executable).parent,
-    ]
-    for root in candidate_roots:
-        browsers_path = root / 'ms-playwright'
-        if browsers_path.exists():
-            os.environ['PLAYWRIGHT_BROWSERS_PATH'] = str(browsers_path)
-            return
+def _validate_inter_word_delay(delay: int) -> None:
+    if (
+        isinstance(delay, bool)
+        or not isinstance(delay, int)
+        or not 0 <= delay <= MAX_INTER_WORD_DELAY
+    ):
+        raise ValueError(f'inter-word delay must be between 0 and {MAX_INTER_WORD_DELAY} seconds')
 
 
-def _extract_definitions_and_etymology(page) -> tuple[list[str], str]:
-    """Extract DLE definitions and etymology from the current page."""
-    first_ol = page.locator(FIRST_DEFINITIONS_SELECTOR).first
-    definition_items = first_ol.locator(DEFINITIONS_ITEM_SELECTOR).all()
+class RAEApiError(RuntimeError):
+    """Raised when the RAE API request fails or returns an invalid response."""
+
+
+def _api_key_file() -> Path:
+    """Find API.txt next to the script or portable executable."""
+    app_directory = Path(sys.executable).parent if getattr(sys, 'frozen', False) else Path(__file__).parent
+    return app_directory / 'API.txt'
+
+
+def _load_api_key() -> str | None:
+    """Read an optional RAE API key without exposing it in logs or URLs."""
+    key_file = _api_key_file()
+    if not key_file.is_file():
+        return None
+
+    content = key_file.read_text(encoding='utf-8-sig')
+    for line in content.splitlines():
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+        if ':' in line:
+            _, key = line.split(':', 1)
+        elif '=' in line:
+            _, key = line.split('=', 1)
+        else:
+            key = line
+        key = key.strip().strip('"').strip("'")
+        if not key:
+            raise RAEApiError(f'No API key value was found in {key_file.name}.')
+        return key
+    return None
+
+
+def _api_text(value: object) -> str:
+    """Convert optional API HTML/text fields into readable plain text."""
+    if not isinstance(value, str):
+        return ''
+    text = re.sub(r'<[^>]+>', ' ', value)
+    return WHITESPACE_RE.sub(' ', html.unescape(text)).strip()
+
+
+def _remove_related_words(definition: str) -> str:
+    """Drop synonym and antonym sections appended to API sense text."""
+    return RELATED_WORDS_RE.sub('', definition).rstrip()
+
+
+def _response_header(headers, *names: str) -> str | None:
+    normalized = {str(key).lower(): str(value) for key, value in headers.items()}
+    for name in names:
+        value = normalized.get(name.lower())
+        if value is not None:
+            return value
+    return None
+
+
+def get_definitions_from_api(
+    word: str,
+    api_key: str | None = None,
+    usage_callback=None,
+    *,
+    load_api_key: bool = True,
+) -> tuple[list[str], str]:
+    """Look up a word through rae-api.com and normalize its senses."""
+    normalized_word = word.strip().lower()
+    if not normalized_word:
+        return [], ''
+
+    request = Request(
+        f'{RAE_API_BASE_URL}/{quote(normalized_word, safe="")}',
+        headers={'Accept': 'application/json'},
+    )
+    if load_api_key and api_key is None:
+        api_key = _load_api_key()
+    if api_key:
+        request.add_header('X-API-Key', api_key)
+
+    try:
+        with urlopen(request, timeout=30) as response:
+            if usage_callback:
+                usage_callback(response.headers)
+            payload = json.loads(response.read().decode('utf-8'))
+    except HTTPError as exc:
+        if usage_callback:
+            usage_callback(exc.headers)
+        if exc.code == 404:
+            return [], ''
+        if exc.code == 429:
+            retry_after = exc.headers.get('Retry-After', 'not provided')
+            raise RAEApiError(
+                f'RAE API rate limit reached (HTTP 429; Retry-After: {retry_after}). '
+                'The batch was stopped without automatic retries.'
+            ) from exc
+        if exc.code in (401, 403):
+            raise RAEApiError(
+                f'RAE API rejected authentication (HTTP {exc.code}); check API.txt.'
+            ) from exc
+        raise RAEApiError(f'RAE API request failed (HTTP {exc.code}).') from exc
+    except URLError as exc:
+        raise RAEApiError(f'Could not reach the RAE API: {exc.reason}.') from exc
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RAEApiError('RAE API returned an invalid JSON response.') from exc
+
+    if not isinstance(payload, dict) or payload.get('ok') is not True:
+        raise RAEApiError('RAE API returned an unsuccessful response.')
+    data = payload.get('data')
+    if not isinstance(data, dict):
+        raise RAEApiError('RAE API response is missing its word data.')
 
     definitions: list[str] = []
-    for item in definition_items:
-        text_blocks = item.locator('div.c-definitions__item > div:not(.c-definitions__item-footer)')
-        if text_blocks.count():
-            definition = text_blocks.first.inner_text().strip()
-            if definition:
-                definitions.append(definition)
+    etymology = ''
+    meanings = data.get('meanings', [])
+    if not isinstance(meanings, list):
+        raise RAEApiError('RAE API returned invalid meanings data.')
 
-    etymology_locator = page.locator(ETYMOLOGY_SELECTOR)
-    etymology = etymology_locator.first.inner_text().strip() if etymology_locator.count() else ''
+    for meaning in meanings:
+        if not isinstance(meaning, dict):
+            continue
+        if not etymology:
+            origin = meaning.get('origin')
+            if isinstance(origin, dict):
+                etymology = _api_text(origin.get('text') or origin.get('raw'))
+        senses = meaning.get('senses', [])
+        if not isinstance(senses, list):
+            continue
+        for sense in senses:
+            if isinstance(sense, dict):
+                definition = _remove_related_words(_api_text(sense.get('raw')))
+                if definition:
+                    definitions.append(definition)
+
     return definitions, etymology
 
 
-def _is_cloudflare_challenge(page) -> bool:
-    """Detect Cloudflare anti-bot verification pages that block automated lookups."""
-    try:
-        title = page.title().lower()
-        body_text = page.locator('body').inner_text().lower()
-    except Exception:
-        return False
-    challenge_markers = (
-        'just a moment',
-        'performing security verification',
-        'checking your browser before accessing',
-        'cloudflare',
-    )
-    return any(marker in title or marker in body_text for marker in challenge_markers)
+class RAEApiClient:
+    """Pace one batch against the documented API quota and report usage headers."""
 
+    def __init__(self, inter_word_delay: int, log_callback):
+        self.api_key = _load_api_key()
+        self.inter_word_delay = inter_word_delay
+        self.log = log_callback
+        self.minimum_interval = 6.0
+        self.next_request_at = 0.0
+        self.daily_remaining: int | None = None
+        self.minute_remaining: int | None = None
 
-def _manual_browser_lookup(word: str) -> tuple[list[str], str]:
-    """Open a visible browser so the user can solve Cloudflare and resume the lookup."""
-    with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(headless=False)
-        try:
-            page = browser.new_page(
-                user_agent=(
-                    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                    'AppleWebKit/537.36 (KHTML, like Gecko) '
-                    'Chrome/125.0.0.0 Safari/537.36'
-                )
+    def _record_usage(self, headers) -> None:
+        tier = _response_header(headers, 'X-RateLimit-Tier', 'RateLimit-Tier')
+        minute_limit = _response_header(
+            headers, 'X-RateLimit-Minute-Limit', 'RateLimit-Minute-Limit'
+        )
+        minute_remaining = _response_header(
+            headers, 'X-RateLimit-Minute-Remaining', 'RateLimit-Minute-Remaining'
+        )
+        daily_limit = _response_header(
+            headers, 'X-RateLimit-Daily-Limit', 'RateLimit-Daily-Limit'
+        )
+        daily_remaining = _response_header(
+            headers, 'X-RateLimit-Daily-Remaining', 'RateLimit-Daily-Remaining'
+        )
+        reset = _response_header(headers, 'X-RateLimit-Minute-Reset', 'RateLimit-Minute-Reset')
+
+        if minute_limit:
+            try:
+                limit = int(minute_limit)
+                if limit > 0:
+                    self.minimum_interval = 60.0 / limit
+            except ValueError:
+                pass
+        if minute_remaining:
+            try:
+                self.minute_remaining = int(minute_remaining)
+            except ValueError:
+                self.minute_remaining = None
+        if daily_remaining:
+            try:
+                self.daily_remaining = int(daily_remaining)
+            except ValueError:
+                self.daily_remaining = None
+
+        details = []
+        if tier:
+            details.append(f'tier {tier}')
+        if minute_remaining is not None:
+            details.append(f'minute quota {minute_remaining}/{minute_limit or "?"} remaining')
+        if daily_remaining is not None:
+            details.append(f'daily quota {daily_remaining}/{daily_limit or "?"} remaining')
+        if reset:
+            details.append(f'minute reset {reset}')
+        if details:
+            self.log('RAE API usage: ' + '; '.join(details) + '.')
+
+    def lookup(self, word: str) -> tuple[list[str], str]:
+        if self.daily_remaining == 0:
+            raise RAEApiError(
+                'RAE API daily quota is exhausted. No further requests were sent; try again after the quota resets.'
+            )
+        if self.minute_remaining == 0:
+            raise RAEApiError(
+                'RAE API per-minute quota is exhausted. No further requests were sent; try again after the minute resets.'
             )
 
-            print('Cloudflare challenge detected. A browser window is opening so you can finish verification manually.')
-            print('Solve the challenge in the browser, then the script will continue automatically.')
-            page.goto(SEARCH_URL, timeout=60000)
-            search_selector = None
-            for _ in range(180):
-                search_selector = next(
-                    (selector for selector in SEARCH_INPUT_SELECTORS if page.locator(selector).count()),
-                    None,
-                )
-                if search_selector:
-                    break
-                if _is_cloudflare_challenge(page):
-                    page.wait_for_timeout(2000)
-                    continue
-                page.wait_for_timeout(2000)
-
-            if search_selector is None:
-                raise RuntimeError('DLE is still blocked after the browser challenge was solved.')
-
-            page.fill(search_selector, word)
-            page.click(SUBMIT_BUTTON_SELECTOR)
-            page.wait_for_selector(FIRST_DEFINITIONS_SELECTOR, timeout=120000)
-            return _extract_definitions_and_etymology(page)
-        finally:
-            browser.close()
+        now = time.monotonic()
+        wait = max(self.minimum_interval, float(self.inter_word_delay))
+        remaining_wait = self.next_request_at - now
+        if remaining_wait > 0:
+            self.log(f'Waiting {remaining_wait:.1f} second(s) to respect the RAE API limit.')
+            time.sleep(remaining_wait)
+        self.next_request_at = time.monotonic() + wait
+        return get_definitions_from_api(
+            word, self.api_key, self._record_usage, load_api_key=False
+        )
 
 
 def get_definitions(word: str) -> tuple[list[str], str]:
-    """Fetch the first DLE entry definitions and etymology for a word."""
-    with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(headless=True)
-        try:
-            page = browser.new_page(
-                user_agent=(
-                    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                    'AppleWebKit/537.36 (KHTML, like Gecko) '
-                    'Chrome/125.0.0.0 Safari/537.36'
-                )
-            )
-
-            page.goto(SEARCH_URL, timeout=60000)
-            if _is_cloudflare_challenge(page):
-                return _manual_browser_lookup(word)
-
-            search_selector = next(
-                (selector for selector in SEARCH_INPUT_SELECTORS if page.locator(selector).count()),
-                None,
-            )
-            if search_selector:
-                page.fill(search_selector, word)
-                page.click(SUBMIT_BUTTON_SELECTOR)
-
-            try:
-                page.wait_for_selector(FIRST_DEFINITIONS_SELECTOR, timeout=20000)
-            except PlaywrightTimeoutError:
-                word_url = f'https://dle.rae.es/{quote(word.strip().lower())}'
-                page.goto(word_url, timeout=60000)
-                if _is_cloudflare_challenge(page):
-                    return _manual_browser_lookup(word)
-                try:
-                    page.wait_for_selector(FIRST_DEFINITIONS_SELECTOR, timeout=20000)
-                except PlaywrightTimeoutError:
-                    return [], ''
-
-            if _is_cloudflare_challenge(page):
-                return _manual_browser_lookup(word)
-
-            return _extract_definitions_and_etymology(page)
-        finally:
-            browser.close()
+    """Fetch a word from the RAE API."""
+    return get_definitions_from_api(word)
 
 
 def read_words_file(words_file: str) -> list[str]:
@@ -197,6 +286,7 @@ def format_entry_word(word: str) -> str:
     return word[:1].lower() + word[1:]
 
 
+@lru_cache(maxsize=8192)
 def strip_accents(text: str) -> str:
     """Remove accents for sorting while keeping ñ as its own Spanish letter."""
     text = text.lower().replace('ñ', '\0')
@@ -205,17 +295,20 @@ def strip_accents(text: str) -> str:
     return stripped.replace('\0', 'ñ')
 
 
+@lru_cache(maxsize=8192)
 def spanish_sort_key(text: str) -> tuple[int, ...]:
     """Return a tuple suitable for Spanish alphabetical ordering."""
     normalized = strip_accents(text)
     return tuple(SPANISH_ORDER.get(char, len(SPANISH_ALPHABET) + ord(char)) for char in normalized)
 
 
+@lru_cache(maxsize=8192)
 def entry_key(word: str) -> str:
     """Normalize an entry word for duplicate detection."""
     return strip_accents(format_entry_word(word).strip())
 
 
+@lru_cache(maxsize=8192)
 def entry_letter(word: str) -> str:
     """Return the uppercase letter heading for a word."""
     first_char = strip_accents(format_entry_word(word)).strip()[:1]
@@ -286,7 +379,8 @@ def add_entry_paragraph(document: Document, word: str, definitions: list[str], e
     first_prefix_match = GRAMMAR_PREFIX_RE.match(definitions[0])
     first_prefix = first_prefix_match.group(0) if first_prefix_match else None
 
-    first_definition_run = paragraph.add_run(definitions[0])
+    first_definition_text = SENSE_NUMBER_PREFIX_RE.sub('', definitions[0], count=1)
+    first_definition_run = paragraph.add_run(first_definition_text)
     first_definition_run.font.size = Pt(10)
 
     for index, definition in enumerate(definitions[1:], start=2):
@@ -295,7 +389,10 @@ def add_entry_paragraph(document: Document, word: str, definitions: list[str], e
         number_run = paragraph.add_run(f'{index}.')
         number_run.bold = True
         number_run.font.size = Pt(10)
-        definition_run = paragraph.add_run(f' {strip_repeated_grammar_prefix(definition, first_prefix)}')
+        definition_text = SENSE_NUMBER_PREFIX_RE.sub('', definition, count=1)
+        definition_run = paragraph.add_run(
+            f' {strip_repeated_grammar_prefix(definition_text, first_prefix)}'
+        )
         definition_run.font.size = Pt(10)
 
     return paragraph
@@ -379,19 +476,26 @@ def insert_entry_in_order(document: Document, entry_paragraph, word: str) -> Non
         move_paragraph_after(paragraph, heading)
 
 
-def save_to_docx(word: str, definitions: list[str], etymology: str, output_path: str) -> None:
-    """Create or update a DOCX with one formatted entry."""
+def save_to_docx(
+    word: str,
+    definitions: list[str],
+    etymology: str,
+    output_path: str,
+    *,
+    document: Document | None = None,
+) -> Document:
+    """Create or update a DOCX entry in the provided document, or a fresh one if needed."""
     path = Path(output_path)
-    document = Document(path) if path.exists() else Document()
+    document = document if document is not None else Document(path) if path.exists() else Document()
     entry_paragraph = add_entry_paragraph(document, word, definitions, etymology)
     insert_entry_in_order(document, entry_paragraph, word)
-    document.save(path)
+    return document
 
 
 def build_parser() -> argparse.ArgumentParser:
     """Create the command-line parser."""
     parser = argparse.ArgumentParser(
-        description='Scrape the DLE online dictionary and write entries to a DOCX.'
+        description='Look up words through rae-api.com and write entries to a DOCX.'
     )
     parser.add_argument('word', nargs='?', help='Word to look up')
     parser.add_argument(
@@ -412,7 +516,27 @@ def build_parser() -> argparse.ArgumentParser:
         action='store_true',
         help='Open the CustomTkinter interface instead of running in the terminal',
     )
+    parser.add_argument(
+        '--delay-between-words',
+        type=_parse_inter_word_delay,
+        default=DEFAULT_INTER_WORD_DELAY,
+        metavar='SECONDS',
+        help=(
+            f'Additional safety delay between API lookups (0-{MAX_INTER_WORD_DELAY}, '
+            f'default: {DEFAULT_INTER_WORD_DELAY}; the app also respects the API quota limits)'
+        ),
+    )
     return parser
+
+
+def _parse_inter_word_delay(value: str) -> int:
+    """Parse the bounded pause between DLE lookups."""
+    try:
+        delay = int(value)
+        _validate_inter_word_delay(delay)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+    return delay
 
 
 def log_run_summary(not_found_words: list[str], already_existing_words: list[str], log_callback) -> None:
@@ -441,22 +565,27 @@ def run_dictionary_build(
     words: list[str],
     output_path: str,
     log_callback=print,
+    inter_word_delay: int = DEFAULT_INTER_WORD_DELAY,
 ) -> tuple[list[str], list[str]]:
     """Look up words, save entries, and report progress through a callback."""
+    _validate_inter_word_delay(inter_word_delay)
     not_found_words = []
     already_existing_words = []
-    existing_words = existing_entry_words(Document(output_path)) if Path(output_path).exists() else set()
+    document = Document(output_path) if Path(output_path).exists() else None
+    existing_words = existing_entry_words(document) if document is not None else set()
+    api_client = RAEApiClient(inter_word_delay, log_callback)
+    modified = False
 
     for word in words:
-        if entry_key(word) in existing_words:
+        normalized_word = entry_key(word)
+        if normalized_word in existing_words:
             already_existing_words.append(word)
             continue
 
         try:
-            definitions, etymology = get_definitions(word)
-        except Error as exc:
-            log_callback(f'Playwright error for "{word}": {exc}')
-            continue
+            definitions, etymology = api_client.lookup(word)
+        except RAEApiError:
+            raise
         except Exception as exc:
             log_callback(f'Lookup failed for "{word}": {exc}')
             continue
@@ -466,16 +595,22 @@ def run_dictionary_build(
             log_callback(f'No definition found for "{word}" in DLE.')
             continue
 
-        save_to_docx(word, definitions, etymology, output_path)
-        existing_words.add(entry_key(word))
+        if document is None:
+            document = Document()
+        document = save_to_docx(word, definitions, etymology, output_path, document=document)
+        existing_words.add(normalized_word)
+        modified = True
 
         log_callback(f'Definitions for "{word}":')
-        log_callback('Etimología:')
+        log_callback('Etimologí:')
         log_callback(etymology)
         log_callback('Definiciones:')
         for index, definition in enumerate(definitions, start=1):
             log_callback(f'{index}. {definition}')
         log_callback(f'Output saved to {output_path}')
+
+    if modified and document is not None:
+        document.save(output_path)
 
     return not_found_words, already_existing_words
 
@@ -496,14 +631,16 @@ def run_gui() -> int:
         def __init__(self):
             super().__init__()
             self.title('DLE DOCX Builder')
-            self.geometry('760x620')
+            self.geometry('760x660')
             self.minsize(680, 540)
             self.output_path = ctk.StringVar(value=DEFAULT_OUTPUT_PATH)
+            self.inter_word_delay = ctk.StringVar(value=str(DEFAULT_INTER_WORD_DELAY))
+            self.show_advanced = False
             self.worker: threading.Thread | None = None
 
             self.grid_columnconfigure(0, weight=1)
             self.grid_rowconfigure(1, weight=1)
-            self.grid_rowconfigure(4, weight=1)
+            self.grid_rowconfigure(6, weight=1)
 
             header = ctk.CTkFrame(self, fg_color='transparent')
             header.grid(row=0, column=0, sticky='ew', padx=18, pady=(16, 8))
@@ -541,17 +678,47 @@ def run_gui() -> int:
                 row=0, column=2, sticky='e', padx=(8, 0)
             )
 
+            self.advanced_toggle = ctk.CTkButton(
+                self,
+                text='Show advanced settings',
+                width=170,
+                command=self.toggle_advanced_settings,
+            )
+            self.advanced_toggle.grid(row=4, column=0, sticky='w', padx=18, pady=(0, 8))
+
+            self.delay_row = ctk.CTkFrame(self, fg_color='transparent')
+            self.delay_row.grid(row=5, column=0, sticky='ew', padx=18, pady=(0, 10))
+            self.delay_row.grid_remove()
+            ctk.CTkLabel(self.delay_row, text='Extra safety delay (seconds)').grid(
+                row=0, column=0, sticky='w', padx=(0, 8)
+            )
+            ctk.CTkEntry(self.delay_row, width=90, textvariable=self.inter_word_delay).grid(
+                row=0, column=1, sticky='w'
+            )
+            ctk.CTkLabel(self.delay_row, text=f'0-{MAX_INTER_WORD_DELAY}').grid(
+                row=0, column=2, sticky='w', padx=(8, 0)
+            )
+
             self.log_text = ctk.CTkTextbox(self, height=190, wrap='word', state='disabled')
-            self.log_text.grid(row=4, column=0, sticky='nsew', padx=18, pady=(0, 10))
+            self.log_text.grid(row=6, column=0, sticky='nsew', padx=18, pady=(0, 10))
 
             footer = ctk.CTkFrame(self, fg_color='transparent')
-            footer.grid(row=5, column=0, sticky='ew', padx=18, pady=(0, 16))
+            footer.grid(row=7, column=0, sticky='ew', padx=18, pady=(0, 16))
             footer.grid_columnconfigure(0, weight=1)
             self.progress = ctk.CTkProgressBar(footer, mode='indeterminate')
             self.progress.grid(row=0, column=0, sticky='ew', padx=(0, 10))
             self.progress.set(0)
             self.run_button = ctk.CTkButton(footer, text='Build DOCX', width=130, command=self.start_build)
             self.run_button.grid(row=0, column=1, sticky='e')
+
+        def toggle_advanced_settings(self) -> None:
+            self.show_advanced = not self.show_advanced
+            if self.show_advanced:
+                self.delay_row.grid()
+                self.advanced_toggle.configure(text='Hide advanced settings')
+            else:
+                self.delay_row.grid_remove()
+                self.advanced_toggle.configure(text='Show advanced settings')
 
         def load_words_file(self) -> None:
             path = filedialog.askopenfilename(
@@ -592,21 +759,36 @@ def run_gui() -> int:
             if not output_path:
                 messagebox.showwarning('No output file', 'Choose a DOCX output path.')
                 return
+            try:
+                inter_word_delay = _parse_inter_word_delay(self.inter_word_delay.get())
+            except argparse.ArgumentTypeError as exc:
+                messagebox.showerror('Invalid delay', str(exc))
+                return
 
             self.set_running(True)
             self.log_text.configure(state='normal')
             self.log_text.delete('1.0', 'end')
             self.log_text.configure(state='disabled')
-            self.log(f'Starting lookup for {len(words)} word(s).')
-            self.worker = threading.Thread(target=self.build_worker, args=(words, output_path), daemon=True)
+            self.log(f'Starting API lookup for {len(words)} word(s).')
+            self.worker = threading.Thread(
+                target=self.build_worker,
+                args=(words, output_path, inter_word_delay),
+                daemon=True,
+            )
             self.worker.start()
 
-        def build_worker(self, words: list[str], output_path: str) -> None:
+        def build_worker(
+            self,
+            words: list[str],
+            output_path: str,
+            inter_word_delay: int,
+        ) -> None:
             try:
                 not_found_words, already_existing_words = run_dictionary_build(
                     words,
                     output_path,
                     log_callback=self.threadsafe_log,
+                    inter_word_delay=inter_word_delay,
                 )
             except Exception as exc:
                 self.threadsafe_log(f'Build failed: {exc}')
@@ -641,7 +823,6 @@ def run_gui() -> int:
 
 def main() -> int:
     """Run the command-line workflow."""
-    configure_playwright_browsers()
     if hasattr(sys.stdout, 'reconfigure'):
         sys.stdout.reconfigure(encoding='utf-8')
     if len(sys.argv) == 1:
@@ -659,7 +840,15 @@ def main() -> int:
     else:
         parser.error('provide a word or use --words-file')
 
-    not_found_words, already_existing_words = run_dictionary_build(words, args.output)
+    try:
+        not_found_words, already_existing_words = run_dictionary_build(
+            words,
+            args.output,
+            inter_word_delay=args.delay_between_words,
+        )
+    except RAEApiError as exc:
+        print(f'Lookup stopped: {exc}', file=sys.stderr)
+        return 1
     print_run_summary(not_found_words, already_existing_words)
     return 0
 

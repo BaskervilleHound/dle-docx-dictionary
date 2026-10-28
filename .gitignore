@@ -13,6 +13,7 @@ dist/
 # Generated dictionary files
 *.docx
 *.pdf
+API.txt
 
 # Editor and OS files
 .idea/

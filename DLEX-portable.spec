@@ -1,24 +1,10 @@
 # -*- mode: python ; coding: utf-8 -*-
 
-import os
-
-
-playwright_browsers = os.path.join(os.environ['LOCALAPPDATA'], 'ms-playwright')
-playwright_datas = [
-    (
-        os.path.join(playwright_browsers, name),
-        os.path.join('ms-playwright', name),
-    )
-    for name in os.listdir(playwright_browsers)
-    if name == '.links' or name.startswith('chromium')
-]
-
-
 a = Analysis(
     ['dlex.py'],
     pathex=[],
     binaries=[],
-    datas=playwright_datas,
+    datas=[],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
