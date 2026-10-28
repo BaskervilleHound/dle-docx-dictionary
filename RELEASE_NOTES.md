@@ -2,21 +2,30 @@
 
 ## Download
 
-Use `DLEX-portable.exe` from the GitHub Release assets.
+Download `DLEX-portable.exe` from this GitHub Release. It is a portable Windows
+application; no Python installation or installer is required. Double-click the
+executable to open the graphical interface.
 
-This is a portable Windows build: no installer and no Python setup required.
-Double-click the exe to open the graphical interface.
+## What's new
+
+- Uses the rae-api.com API for dictionary lookups.
+- Automatically paces requests according to API quota headers, with a
+  conservative free-tier pace until the API reports a limit.
+- Supports an optional API key and an optional extra safety delay.
+- Includes the same command-line workflow as `dlex.py`.
+
+To use an API key, place `API.txt` next to `DLEX-portable.exe`. The key is
+provided by the API provider and uses the quota assigned to that account.
+Never share or commit the key file.
 
 ## Notes
 
-- The app includes Chromium for DLE lookups, so the download is large.
-- Windows SmartScreen may warn on first launch because the exe is unsigned.
-- Keep an internet connection available while looking up words.
+- An internet connection is required for lookups.
+- Windows SmartScreen may warn on first launch because the executable is
+  unsigned.
 - The default output file is `diccionario.docx`.
 
-## Command Line
-
-The same executable also supports the command-line workflow:
+## Command line
 
 ```powershell
 .\DLEX-portable.exe amor
@@ -28,5 +37,5 @@ The same executable also supports the command-line workflow:
 SHA256:
 
 ```text
-DLEX-portable.exe  0D0A52F672C2DB306D9F4581D8516D9326B30C47C46003BE7F29A1D955F2BA53
+See SHA256SUMS.txt in the repository.
 ```
